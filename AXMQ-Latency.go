@@ -1,71 +1,83 @@
 package main
 
 import (
+	"flag"
 	"fmt"
-	"net"
 	"os"
 	"sort"
+	"sync"
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 )
 
 func main() {
-	cid := "AXMQ-Latency-Prober-Final"
-	opts := mqtt.NewClientOptions().
-		AddBroker("tcp://172.28.130.87:1883").
-		SetClientID(cid)
+	// 1. 解析动态参数
+	broker := flag.String("h", "172.28.130.87", "Broker IP")
+	count := flag.Int("n", 2000, "采样总数")
+	interval := flag.Int("i", 10, "发送间隔(ms)")
+	flag.Parse()
 
-	opts.SetDialer(&net.Dialer{
-		LocalAddr: &net.TCPAddr{
-			IP: net.ParseIP("172.28.130.109"),
-		},
-		Timeout: 10 * time.Second,
-	})
+	opts := mqtt.NewClientOptions().
+		AddBroker(fmt.Sprintf("tcp://%s:1883", *broker)).
+		SetClientID("AXMQ-Prober-Advanced").
+		SetCleanSession(true)
 
 	client := mqtt.NewClient(opts)
-	fmt.Println("正在 1M 连接背景下尝试探测...")
+	fmt.Printf("正在连接 %s 进行延迟探测 (目标样本: %d)...\n", *broker, *count)
+
 	if token := client.Connect(); token.Wait() && token.Error() != nil {
-		fmt.Fprintf(os.Stderr, "❌ 无法连接 (可能是 1M 负载下 IP 端口全满): %v\n", token.Error())
+		fmt.Fprintf(os.Stderr, "❌ 连接失败: %v\n", token.Error())
 		os.Exit(1)
 	}
 
-	latencies := []time.Duration{}
-	msgCount := 300
-	receivedChan := make(chan bool)
+	var mu sync.Mutex
+	latencies := make([]time.Duration, 0, *count)
+	done := make(chan struct{})
 
+	// 2. 订阅并计算延迟 (增加互斥锁)
 	client.Subscribe("latency/test/prober", 0, func(c mqtt.Client, m mqtt.Message) {
+		now := time.Now().UnixNano()
 		var sentTime int64
 		fmt.Sscanf(string(m.Payload()), "%d", &sentTime)
-		latencies = append(latencies, time.Duration(time.Now().UnixNano()-sentTime))
-		if len(latencies) >= msgCount {
+
+		mu.Lock()
+		latencies = append(latencies, time.Duration(now-sentTime))
+		if len(latencies) >= *count {
 			select {
-			case receivedChan <- true:
+			case done <- struct{}{}:
 			default:
 			}
 		}
+		mu.Unlock()
 	})
 
-	for i := 0; i < msgCount; i++ {
-		payload := fmt.Sprintf("%d", time.Now().UnixNano())
-		client.Publish("latency/test/prober", 0, false, payload)
-		time.Sleep(20 * time.Millisecond)
-	}
+	// 3. 发送采样包
+	go func() {
+		for i := 0; i < *count; i++ {
+			payload := fmt.Sprintf("%d", time.Now().UnixNano())
+			client.Publish("latency/test/prober", 0, false, payload)
+			time.Sleep(time.Duration(*interval) * time.Millisecond)
+		}
+	}()
 
+	// 4. 等待完成或超时
 	select {
-	case <-receivedChan:
-		fmt.Println("✅ 1M 负载背景采样完成!")
-	case <-time.After(15 * time.Second):
-		fmt.Printf("⚠️ 采样超时, 收到回包: %d\n", len(latencies))
+	case <-done:
+		fmt.Println("✅ 采样完成!")
+	case <-time.After(30 * time.Second):
+		fmt.Printf("⚠️ 采样超时, 仅收到 %d 个包\n", len(latencies))
 	}
 
+	// 5. 统计输出
 	if len(latencies) > 0 {
 		sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
-		fmt.Printf("\n--- 1M 连接负载背景下的延迟分布 ---\n")
-		fmt.Printf("P50: %v\n", latencies[len(latencies)*50/100])
-		fmt.Printf("P95: %v\n", latencies[len(latencies)*95/100])
-		fmt.Printf("P99: %v\n", latencies[len(latencies)*99/100])
-		fmt.Printf("Max: %v\n", latencies[len(latencies)-1])
+		l := len(latencies)
+		fmt.Printf("\n--- 延迟分布统计 (%d 样本) ---\n", l)
+		fmt.Printf("P50: %v\n", latencies[l*50/100])
+		fmt.Printf("P95: %v\n", latencies[l*95/100])
+		fmt.Printf("P99: %v\n", latencies[l*99/100])
+		fmt.Printf("Max: %v\n", latencies[l-1])
 	}
 	client.Disconnect(250)
 }
