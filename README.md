@@ -1,2 +1,14 @@
-# AXMQ-Latency
-AXMQ-Latency
+### 运行探测
+```bash
+# 编译
+go build -o prober AXMQ-Latency.go
+
+# 执行 (针对 1M 负载环境，建议采样 2000 个包，间隔 10ms)
+./prober -h 172.28.130.87 -n 2000 -i 10
+
+# 期望输出示例 (基于 1M 连接实测数据):
+# P50: 223.692µs
+# P95: 301.08µs
+# P99: 33.981ms
+# Max: 70.284ms
+```
